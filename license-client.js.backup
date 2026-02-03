@@ -1,0 +1,1711 @@
+const crypto = require('crypto');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
+const SignatureVerifier = require('./signature-verifier');
+
+/**
+ * License Management Platform - JavaScript/Node.js SDK Client
+ * 
+ * Official Node.js client for license validation, activation, and management.
+ * 
+ * @version 2.0.0
+ * @license MIT
+ */
+class LicenseClient {
+    static VERSION = '2.0.0';
+    static DEFAULT_TIMEOUT = 30000;
+    static DEFAULT_CACHE_TTL = 300;
+    static MAX_RETRY_ATTEMPTS = 3;
+    static RETRY_DELAY_MS = 1000;
+
+    constructor(config) {
+        this.validateConfig(config);
+
+        this.apiKey = config.apiKey;
+        this.baseUrl = config.baseUrl || 'https://api.getkeymanager.com';
+        this.timeout = config.timeout || LicenseClient.DEFAULT_TIMEOUT;
+        this.verifySignatures = config.verifySignatures !== false;
+        this.publicKey = config.publicKey || null;
+        this.environment = config.environment || null;
+        this.cacheEnabled = config.cacheEnabled !== false;
+        this.cacheTtl = config.cacheTtl || LicenseClient.DEFAULT_CACHE_TTL;
+        this.retryAttempts = config.retryAttempts || LicenseClient.MAX_RETRY_ATTEMPTS;
+        this.retryDelay = config.retryDelay || LicenseClient.RETRY_DELAY_MS;
+        this.cache = new Map();
+
+        if (this.verifySignatures && this.publicKey) {
+            this.signatureVerifier = new SignatureVerifier(this.publicKey);
+        }
+    }
+
+    /**
+     * Validate a license key online
+     * 
+     * @param {string} licenseKey - License key to validate
+     * @param {Object} options - Optional parameters (hardwareId, domain, productId)
+     * @returns {Promise<Object>} Validation result
+     */
+    async validateLicense(licenseKey, options = {}) {
+        this.validateLicenseKey(licenseKey);
+
+        const cacheKey = this.getCacheKey('license', licenseKey, 'validation');
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const payload = { license_key: licenseKey, ...options };
+        
+        const response = await this.request('POST', '/v1/verify', payload);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Activate a license on a device or domain
+     * 
+     * @param {string} licenseKey - License key
+     * @param {Object} options - Activation options (hardwareId OR domain required)
+     * @returns {Promise<Object>} Activation result
+     */
+    async activateLicense(licenseKey, options = {}) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!options.hardwareId && !options.domain) {
+            throw new ValidationError('Either hardwareId or domain is required');
+        }
+
+        const payload = { license_key: licenseKey, ...options };
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+        
+        const response = await this.request(
+            'POST',
+            '/v1/activate',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Deactivate a license from a device or domain
+     * 
+     * @param {string} licenseKey - License key
+     * @param {Object} options - Deactivation options
+     * @returns {Promise<Object>} Deactivation result
+     */
+    async deactivateLicense(licenseKey, options = {}) {
+        this.validateLicenseKey(licenseKey);
+
+        const payload = { license_key: licenseKey, ...options };
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/deactivate',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Check if a feature is enabled for a license
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} featureName - Feature name
+     * @returns {Promise<Object>} Feature check result
+     */
+    async checkFeature(licenseKey, featureName) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!featureName) {
+            throw new ValidationError('Feature name cannot be empty');
+        }
+
+        const cacheKey = this.getCacheKey('license', licenseKey, 'feature', featureName);
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const response = await this.request(
+            'GET',
+            `/v1/licenses/${licenseKey}/features/${featureName}`
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Validate an offline license file
+     * 
+     * @param {string|Object} offlineLicenseData - JSON string or parsed object
+     * @param {Object} options - Validation options (hardwareId, publicKey)
+     * @returns {Promise<Object>} Validation result
+     */
+    async validateOfflineLicense(offlineLicenseData, options = {}) {
+        let data;
+        
+        if (typeof offlineLicenseData === 'string') {
+            try {
+                data = JSON.parse(offlineLicenseData);
+            } catch (e) {
+                throw new ValidationError('Invalid JSON: ' + e.message);
+            }
+        } else {
+            data = offlineLicenseData;
+        }
+
+        const errors = [];
+
+        if (!data.license || !data.signature) {
+            throw new ValidationError('Invalid offline license format');
+        }
+
+        const publicKey = options.publicKey || this.publicKey;
+        if (!publicKey) {
+            throw new ValidationError('Public key is required for offline validation');
+        }
+
+        const verifier = new SignatureVerifier(publicKey);
+        const signature = data.signature;
+        const dataWithoutSignature = { ...data };
+        delete dataWithoutSignature.signature;
+
+        try {
+            const payload = JSON.stringify(dataWithoutSignature);
+            if (!verifier.verify(payload, signature)) {
+                errors.push('Signature verification failed');
+            }
+        } catch (e) {
+            errors.push('Signature verification error: ' + e.message);
+        }
+
+        // Check expiration with tolerance
+        if (data.license.expires_at) {
+            const expiresAt = new Date(data.license.expires_at).getTime();
+            const now = Date.now();
+            const tolerance = 24 * 3600 * 1000; // 24 hours
+
+            if (now - tolerance > expiresAt) {
+                errors.push('License has expired');
+            }
+        }
+
+        // Check hardware ID
+        if (options.hardwareId && data.license.hardware_id) {
+            if (options.hardwareId !== data.license.hardware_id) {
+                errors.push('Hardware ID mismatch');
+            }
+        }
+
+        return {
+            valid: errors.length === 0,
+            license: data.license || {},
+            errors
+        };
+    }
+
+    /**
+     * Send telemetry data
+     * 
+     * @param {string} dataType - Data type: 'numeric-single-value', 'numeric-xy-axis', or 'text'
+     * @param {string} dataGroup - Data group/category
+     * @param {Object} dataValues - Data values based on type
+     * @param {Object} options - Optional parameters (license_key, activation_identifier, user_identifier, product_id, product_version)
+     * @returns {Promise<Object>} Result
+     */
+    async sendTelemetry(dataType, dataGroup, dataValues = {}, options = {}) {
+        try {
+            // Validate data type
+            const validDataTypes = ['numeric-single-value', 'numeric-xy-axis', 'text'];
+            if (!validDataTypes.includes(dataType)) {
+                throw new Error(`Invalid data_type. Must be one of: ${validDataTypes.join(', ')}`);
+            }
+
+            // Build payload based on data type
+            const data = {
+                data_type: dataType,
+                data_group: dataGroup,
+            };
+
+            // Add conditional data fields based on type
+            switch (dataType) {
+                case 'numeric-single-value':
+                    if (dataValues.value === undefined) {
+                        throw new Error('numeric_data_single_value is required for numeric-single-value type');
+                    }
+                    data.numeric_data_single_value = dataValues.value;
+                    break;
+                case 'numeric-xy-axis':
+                    if (dataValues.x === undefined || dataValues.y === undefined) {
+                        throw new Error('numeric_data_x and numeric_data_y are required for numeric-xy-axis type');
+                    }
+                    data.numeric_data_x = dataValues.x;
+                    data.numeric_data_y = dataValues.y;
+                    break;
+                case 'text':
+                    if (dataValues.text === undefined) {
+                        throw new Error('text_data is required for text type');
+                    }
+                    data.text_data = dataValues.text;
+                    break;
+            }
+
+            // Add optional context fields
+            if (options.license_key) data.license_key = options.license_key;
+            if (options.activation_identifier) data.activation_identifier = options.activation_identifier;
+            if (options.user_identifier) data.user_identifier = options.user_identifier;
+            if (options.product_id) data.product_id = options.product_id;
+            if (options.product_version) data.product_version = options.product_version;
+
+            const response = await this.request('POST', '/v1/send-telemetry', data);
+
+            return {
+                success: true,
+                telemetry_id: response.telemetry_id || null,
+                is_flagged: response.is_flagged || false,
+            };
+        } catch (e) {
+            return {
+                success: false,
+                error: e.message
+            };
+        }
+    }
+
+    /**
+     * Generate hardware ID for current system
+     * 
+     * @returns {string} Hardware ID
+     */
+    generateHardwareId() {
+        const os = require('os');
+        const identifiers = [];
+
+        // Hostname
+        identifiers.push(os.hostname());
+
+        // CPU info
+        const cpus = os.cpus();
+        if (cpus.length > 0) {
+            identifiers.push(cpus[0].model);
+        }
+
+        // Network interfaces
+        const networkInterfaces = os.networkInterfaces();
+        for (const name in networkInterfaces) {
+            const interfaces = networkInterfaces[name];
+            for (const iface of interfaces) {
+                if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
+                    identifiers.push(iface.mac);
+                }
+            }
+        }
+
+        // Platform
+        identifiers.push(os.platform());
+        identifiers.push(os.arch());
+
+        identifiers.sort();
+        const combined = identifiers.join('|');
+        
+        return crypto.createHash('sha256').update(combined).digest('hex').substring(0, 32);
+    }
+
+    // ========================================================================
+    // LICENSE MANAGEMENT METHODS
+    // ========================================================================
+
+    /**
+     * Create license keys
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} generatorUuid - Generator UUID
+     * @param {Array} licenses - Array of license data
+     * @param {string|null} customerEmail - Optional customer email
+     * @param {Object} options - Additional options (idempotencyKey)
+     * @returns {Promise<Object>} Created licenses
+     */
+    async createLicenseKeys(productUuid, generatorUuid, licenses, customerEmail = null, options = {}) {
+        if (!productUuid || !generatorUuid) {
+            throw new ValidationError('Product UUID and Generator UUID are required');
+        }
+
+        if (!Array.isArray(licenses) || licenses.length === 0) {
+            throw new ValidationError('Licenses array cannot be empty');
+        }
+
+        const payload = {
+            product_uuid: productUuid,
+            generator_uuid: generatorUuid,
+            licenses
+        };
+
+        if (customerEmail) {
+            payload.customer_email = customerEmail;
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/create-license-keys',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Update license key
+     * 
+     * @param {string} licenseKey - License key
+     * @param {Object} options - Update options (status, activation_limit, validity_days)
+     * @returns {Promise<Object>} Update result
+     */
+    async updateLicenseKey(licenseKey, options = {}) {
+        this.validateLicenseKey(licenseKey);
+
+        const payload = { license_key: licenseKey };
+
+        if (options.status !== undefined) {
+            payload.status = options.status;
+        }
+
+        if (options.activation_limit !== undefined) {
+            payload.activation_limit = options.activation_limit;
+        }
+
+        if (options.validity_days !== undefined) {
+            payload.validity_days = options.validity_days;
+        }
+
+        const response = await this.request('POST', '/v1/update-license-key', payload);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Delete license key
+     * 
+     * @param {string} licenseKey - License key
+     * @returns {Promise<Object>} Deletion result
+     */
+    async deleteLicenseKey(licenseKey) {
+        this.validateLicenseKey(licenseKey);
+
+        const response = await this.request('POST', '/v1/delete-license-key', {
+            license_key: licenseKey
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Get license keys
+     * 
+     * @param {Object} filters - Optional filters (product_uuid, status, customer_email)
+     * @returns {Promise<Object>} License keys
+     */
+    async getLicenseKeys(filters = {}) {
+        const queryParams = new URLSearchParams();
+
+        if (filters.product_uuid) {
+            queryParams.append('product_uuid', filters.product_uuid);
+        }
+
+        if (filters.status) {
+            queryParams.append('status', filters.status);
+        }
+
+        if (filters.customer_email) {
+            queryParams.append('customer_email', filters.customer_email);
+        }
+
+        let endpoint = '/v1/get-license-keys';
+        const queryString = queryParams.toString();
+        if (queryString) {
+            endpoint += '?' + queryString;
+        }
+
+        const response = await this.request('GET', endpoint);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Get license details
+     * 
+     * @param {string} licenseKey - License key
+     * @returns {Promise<Object>} License details
+     */
+    async getLicenseDetails(licenseKey) {
+        this.validateLicenseKey(licenseKey);
+
+        const cacheKey = this.getCacheKey('license', licenseKey, 'details');
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const response = await this.request('POST', '/v1/get-license-key-details', {
+            license_key: licenseKey
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Get available license keys count
+     * 
+     * @param {string} productUuid - Product UUID
+     * @returns {Promise<Object>} Count result
+     */
+    async getAvailableLicenseKeysCount(productUuid) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        const queryParams = new URLSearchParams({ product_uuid: productUuid });
+        const endpoint = '/v1/get-available-license-keys-count?' + queryParams.toString();
+
+        const response = await this.request('GET', endpoint);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    // ========================================================================
+    // LICENSE ASSIGNMENT METHODS
+    // ========================================================================
+
+    /**
+     * Assign license key to customer
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} customerEmail - Customer email
+     * @param {string|null} customerName - Optional customer name
+     * @returns {Promise<Object>} Assignment result
+     */
+    async assignLicenseKey(licenseKey, customerEmail, customerName = null) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!customerEmail) {
+            throw new ValidationError('Customer email is required');
+        }
+
+        const payload = {
+            license_key: licenseKey,
+            customer_email: customerEmail
+        };
+
+        if (customerName) {
+            payload.customer_name = customerName;
+        }
+
+        const response = await this.request('POST', '/v1/assign-license-key', payload);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Random assign license keys (synchronous)
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} generatorUuid - Generator UUID
+     * @param {number} quantity - Number of licenses to assign
+     * @param {string} customerEmail - Customer email
+     * @param {string|null} customerName - Optional customer name
+     * @param {Object} options - Additional options (idempotencyKey)
+     * @returns {Promise<Object>} Assignment result
+     */
+    async randomAssignLicenseKeys(productUuid, generatorUuid, quantity, customerEmail, customerName = null, options = {}) {
+        if (!productUuid || !generatorUuid) {
+            throw new ValidationError('Product UUID and Generator UUID are required');
+        }
+
+        if (quantity < 1) {
+            throw new ValidationError('Quantity must be at least 1');
+        }
+
+        if (!customerEmail) {
+            throw new ValidationError('Customer email is required');
+        }
+
+        const payload = {
+            product_uuid: productUuid,
+            generator_uuid: generatorUuid,
+            quantity,
+            customer_email: customerEmail
+        };
+
+        if (customerName) {
+            payload.customer_name = customerName;
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/random-assign-license-keys',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Random assign license keys (queued/asynchronous)
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} generatorUuid - Generator UUID
+     * @param {number} quantity - Number of licenses to assign
+     * @param {string} customerEmail - Customer email
+     * @param {string|null} customerName - Optional customer name
+     * @param {Object} options - Additional options (idempotencyKey)
+     * @returns {Promise<Object>} Job queued result
+     */
+    async randomAssignLicenseKeysQueued(productUuid, generatorUuid, quantity, customerEmail, customerName = null, options = {}) {
+        if (!productUuid || !generatorUuid) {
+            throw new ValidationError('Product UUID and Generator UUID are required');
+        }
+
+        if (quantity < 1) {
+            throw new ValidationError('Quantity must be at least 1');
+        }
+
+        if (!customerEmail) {
+            throw new ValidationError('Customer email is required');
+        }
+
+        const payload = {
+            product_uuid: productUuid,
+            generator_uuid: generatorUuid,
+            quantity,
+            customer_email: customerEmail
+        };
+
+        if (customerName) {
+            payload.customer_name = customerName;
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/random-assign-license-keys-queued',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Assign and activate license key
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} customerEmail - Customer email
+     * @param {string} identifier - Hardware ID or domain
+     * @param {Object} options - Additional options (idempotencyKey)
+     * @returns {Promise<Object>} Assignment and activation result
+     */
+    async assignAndActivateLicenseKey(licenseKey, customerEmail, identifier, options = {}) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!customerEmail) {
+            throw new ValidationError('Customer email is required');
+        }
+
+        if (!identifier) {
+            throw new ValidationError('Identifier is required');
+        }
+
+        const payload = {
+            license_key: licenseKey,
+            customer_email: customerEmail,
+            identifier
+        };
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/assign-and-activate-license-key',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    // ========================================================================
+    // LICENSE METADATA METHODS
+    // ========================================================================
+
+    /**
+     * Create license key metadata
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} metaKey - Metadata key
+     * @param {*} metaValue - Metadata value
+     * @returns {Promise<Object>} Creation result
+     */
+    async createLicenseKeyMeta(licenseKey, metaKey, metaValue) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/create-license-key-meta', {
+            license_key: licenseKey,
+            meta_key: metaKey,
+            meta_value: metaValue
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Update license key metadata
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} metaKey - Metadata key
+     * @param {*} metaValue - Metadata value
+     * @returns {Promise<Object>} Update result
+     */
+    async updateLicenseKeyMeta(licenseKey, metaKey, metaValue) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/update-license-key-meta', {
+            license_key: licenseKey,
+            meta_key: metaKey,
+            meta_value: metaValue
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    /**
+     * Delete license key metadata
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} metaKey - Metadata key
+     * @returns {Promise<Object>} Deletion result
+     */
+    async deleteLicenseKeyMeta(licenseKey, metaKey) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/delete-license-key-meta', {
+            license_key: licenseKey,
+            meta_key: metaKey
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearLicenseCache(licenseKey);
+
+        return response;
+    }
+
+    // ========================================================================
+    // PRODUCT MANAGEMENT METHODS
+    // ========================================================================
+
+    /**
+     * Create product
+     * 
+     * @param {string} name - Product name
+     * @param {Object} options - Optional parameters (slug, description, status, idempotencyKey)
+     * @returns {Promise<Object>} Created product
+     */
+    async createProduct(name, options = {}) {
+        if (!name) {
+            throw new ValidationError('Product name is required');
+        }
+
+        const payload = { name };
+
+        if (options.slug) {
+            payload.slug = options.slug;
+        }
+
+        if (options.description) {
+            payload.description = options.description;
+        }
+
+        if (options.status) {
+            payload.status = options.status;
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/create-product',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Update product
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {Object} options - Update parameters (name, description, status)
+     * @returns {Promise<Object>} Update result
+     */
+    async updateProduct(productUuid, options = {}) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        const payload = { product_uuid: productUuid };
+
+        if (options.name) {
+            payload.name = options.name;
+        }
+
+        if (options.description !== undefined) {
+            payload.description = options.description;
+        }
+
+        if (options.status) {
+            payload.status = options.status;
+        }
+
+        const response = await this.request('POST', '/v1/update-product', payload);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Delete product
+     * 
+     * @param {string} productUuid - Product UUID
+     * @returns {Promise<Object>} Deletion result
+     */
+    async deleteProduct(productUuid) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        const response = await this.request('POST', '/v1/delete-product', {
+            product_uuid: productUuid
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Get all products
+     * 
+     * @returns {Promise<Object>} Products list
+     */
+    async getAllProducts() {
+        const cacheKey = this.getCacheKey('products', 'all');
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const response = await this.request('GET', '/v1/get-all-products');
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    // ========================================================================
+    // PRODUCT METADATA METHODS
+    // ========================================================================
+
+    /**
+     * Create product metadata
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} metaKey - Metadata key
+     * @param {*} metaValue - Metadata value
+     * @returns {Promise<Object>} Creation result
+     */
+    async createProductMeta(productUuid, metaKey, metaValue) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/create-product-meta', {
+            product_uuid: productUuid,
+            meta_key: metaKey,
+            meta_value: metaValue
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Update product metadata
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} metaKey - Metadata key
+     * @param {*} metaValue - Metadata value
+     * @returns {Promise<Object>} Update result
+     */
+    async updateProductMeta(productUuid, metaKey, metaValue) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/update-product-meta', {
+            product_uuid: productUuid,
+            meta_key: metaKey,
+            meta_value: metaValue
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    /**
+     * Delete product metadata
+     * 
+     * @param {string} productUuid - Product UUID
+     * @param {string} metaKey - Metadata key
+     * @returns {Promise<Object>} Deletion result
+     */
+    async deleteProductMeta(productUuid, metaKey) {
+        if (!productUuid) {
+            throw new ValidationError('Product UUID is required');
+        }
+
+        if (!metaKey) {
+            throw new ValidationError('Metadata key cannot be empty');
+        }
+
+        const response = await this.request('POST', '/v1/delete-product-meta', {
+            product_uuid: productUuid,
+            meta_key: metaKey
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    // ========================================================================
+    // GENERATOR METHODS
+    // ========================================================================
+
+    /**
+     * Get all generators
+     * 
+     * @param {string|null} productUuid - Optional product UUID filter
+     * @returns {Promise<Object>} Generators list
+     */
+    async getAllGenerators(productUuid = null) {
+        const cacheKey = this.getCacheKey('generators', productUuid || 'all');
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        let endpoint = '/v1/get-all-generators';
+        if (productUuid) {
+            const queryParams = new URLSearchParams({ product_uuid: productUuid });
+            endpoint += '?' + queryParams.toString();
+        }
+
+        const response = await this.request('GET', endpoint);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Generate license keys
+     * 
+     * @param {string} generatorUuid - Generator UUID
+     * @param {number} quantity - Number of licenses to generate
+     * @param {Object} options - Optional parameters (activation_limit, validity_days, idempotencyKey)
+     * @returns {Promise<Object>} Generated licenses
+     */
+    async generateLicenseKeys(generatorUuid, quantity, options = {}) {
+        if (!generatorUuid) {
+            throw new ValidationError('Generator UUID is required');
+        }
+
+        if (quantity < 1) {
+            throw new ValidationError('Quantity must be at least 1');
+        }
+
+        const payload = {
+            generator_uuid: generatorUuid,
+            quantity
+        };
+
+        if (options.activation_limit !== undefined) {
+            payload.activation_limit = options.activation_limit;
+        }
+
+        if (options.validity_days !== undefined) {
+            payload.validity_days = options.validity_days;
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/generate',
+            payload,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    // ========================================================================
+    // CONTRACT METHODS
+    // ========================================================================
+
+    /**
+     * Get all contracts
+     * 
+     * @returns {Promise<Object>} Contracts list
+     */
+    async getAllContracts() {
+        const cacheKey = this.getCacheKey('contracts', 'all');
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const response = await this.request('GET', '/v1/get-all-contracts');
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Create contract
+     * 
+     * @param {Object} contractData - Contract data
+     * @param {Object} options - Additional options (idempotencyKey)
+     * @returns {Promise<Object>} Created contract
+     */
+    async createContract(contractData, options = {}) {
+        const required = [
+            'contract_key', 'contract_name', 'contract_information',
+            'product_id', 'license_keys_quantity', 'status',
+            'can_get_info', 'can_generate', 'can_destroy', 'can_destroy_all'
+        ];
+
+        for (const field of required) {
+            if (contractData[field] === undefined) {
+                throw new ValidationError(`Field '${field}' is required`);
+            }
+        }
+
+        const idempotencyKey = options.idempotencyKey || this.generateUuid();
+
+        const response = await this.request(
+            'POST',
+            '/v1/create-contract',
+            contractData,
+            { 'Idempotency-Key': idempotencyKey }
+        );
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearCache();
+
+        return response;
+    }
+
+    /**
+     * Update contract
+     * 
+     * @param {number} contractId - Contract ID
+     * @param {Object} contractData - Contract data
+     * @returns {Promise<Object>} Update result
+     */
+    async updateContract(contractId, contractData) {
+        if (contractId < 1) {
+            throw new ValidationError('Contract ID must be positive');
+        }
+
+        const payload = { ...contractData, contract_id: contractId };
+
+        const response = await this.request('POST', '/v1/update-contract', payload);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearCache();
+
+        return response;
+    }
+
+    /**
+     * Delete contract
+     * 
+     * @param {number} contractId - Contract ID
+     * @returns {Promise<Object>} Deletion result
+     */
+    async deleteContract(contractId) {
+        if (contractId < 1) {
+            throw new ValidationError('Contract ID must be positive');
+        }
+
+        const response = await this.request('POST', '/v1/delete-contract', {
+            contract_id: contractId
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        this.clearCache();
+
+        return response;
+    }
+
+    // ========================================================================
+    // DOWNLOADABLES METHODS
+    // ========================================================================
+
+    /**
+     * Access downloadables for a license
+     * 
+     * @param {string} licenseKey - License key
+     * @param {string} identifier - Hardware ID or domain
+     * @returns {Promise<Object>} Downloadable files with signed URLs
+     */
+    async accessDownloadables(licenseKey, identifier) {
+        this.validateLicenseKey(licenseKey);
+
+        if (!identifier) {
+            throw new ValidationError('Identifier is required');
+        }
+
+        const response = await this.request('POST', '/v1/access-downloadables', {
+            license_key: licenseKey,
+            identifier
+        });
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    // ========================================================================
+    // TELEMETRY METHODS (EXPANDED)
+    // ========================================================================
+
+    /**
+     * Get telemetry data
+     * 
+     * @param {string} dataType - Data type (numeric-single-value, numeric-xy-axis, text)
+     * @param {string} dataGroup - Data group
+     * @param {Object} filters - Optional filters
+     * @returns {Promise<Object>} Telemetry data
+     */
+    async getTelemetryData(dataType, dataGroup, filters = {}) {
+        if (!dataType || !dataGroup) {
+            throw new ValidationError('Data type and data group are required');
+        }
+
+        const queryParams = new URLSearchParams({
+            data_type: dataType,
+            data_group: dataGroup
+        });
+
+        if (filters.product_id) {
+            queryParams.append('product_id', filters.product_id);
+        }
+
+        if (filters.user_identifier) {
+            queryParams.append('user_identifier', filters.user_identifier);
+        }
+
+        if (filters.license_key) {
+            queryParams.append('license_key', filters.license_key);
+        }
+
+        if (filters.has_red_flags !== undefined) {
+            queryParams.append('has_red_flags', filters.has_red_flags);
+        }
+
+        const endpoint = '/v1/get-telemetry-data?' + queryParams.toString();
+
+        const response = await this.request('GET', endpoint);
+
+        if (this.verifySignatures && response.signature) {
+            this.verifyResponse(response);
+        }
+
+        return response;
+    }
+
+    // ========================================================================
+    // CHANGELOG METHODS (PUBLIC)
+    // ========================================================================
+
+    /**
+     * Get product changelog (public endpoint, no auth required)
+     * 
+     * @param {string} slug - Product slug
+     * @returns {Promise<Object>} Changelog entries
+     */
+    async getProductChangelog(slug) {
+        if (!slug) {
+            throw new ValidationError('Product slug is required');
+        }
+
+        const cacheKey = this.getCacheKey('changelog', slug);
+        const cached = this.getFromCache(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        // This endpoint doesn't require authentication
+        const response = await this.requestPublic('GET', `/v1/products/${slug}/changelog`);
+
+        this.setCache(cacheKey, response);
+
+        return response;
+    }
+
+    /**
+     * Make HTTP request to public API (no authentication)
+     * 
+     * @private
+     */
+    async requestPublic(method, endpoint) {
+        const url = new URL(endpoint, this.baseUrl);
+        
+        const protocol = url.protocol === 'https:' ? https : http;
+        
+        const options = {
+            method,
+            headers: {
+                'Accept': 'application/json',
+                'User-Agent': `GetKeyManager-JS-SDK/${LicenseClient.VERSION}`
+            },
+            timeout: this.timeout
+        };
+
+        return new Promise((resolve, reject) => {
+            const req = protocol.request(url, options, (res) => {
+                let body = '';
+                
+                res.on('data', (chunk) => {
+                    body += chunk;
+                });
+                
+                res.on('end', () => {
+                    try {
+                        const responseData = JSON.parse(body);
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            resolve(responseData);
+                        } else {
+                            reject(new Error('Failed to fetch public data'));
+                        }
+                    } catch (e) {
+                        reject(new Error('Invalid JSON response'));
+                    }
+                });
+            });
+
+            req.on('error', (e) => {
+                reject(new NetworkError('Network error: ' + e.message));
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new NetworkError('Request timeout'));
+            });
+
+            req.end();
+        });
+    }
+
+    /**
+     * Clear all cache
+     */
+    clearCache() {
+        this.cache.clear();
+    }
+
+    /**
+     * Clear cache for specific license
+     * 
+     * @param {string} licenseKey - License key
+     */
+    clearLicenseCache(licenseKey) {
+        const prefix = `license:${licenseKey}:`;
+        for (const key of this.cache.keys()) {
+            if (key.startsWith(prefix)) {
+                this.cache.delete(key);
+            }
+        }
+    }
+
+    /**
+     * Make HTTP request to API
+     * 
+     * @private
+     */
+    async request(method, endpoint, data = null, extraHeaders = {}) {
+        const url = new URL(endpoint, this.baseUrl);
+        
+        const headers = {
+            'X-API-Key': this.apiKey,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': `GetKeyManager-JS-SDK/${LicenseClient.VERSION}`,
+            ...extraHeaders
+        };
+
+        let attempt = 0;
+        let lastError = null;
+
+        while (attempt < this.retryAttempts) {
+            try {
+                const response = await this.makeHttpRequest(method, url, headers, data);
+                
+                if (response.statusCode >= 200 && response.statusCode < 300) {
+                    return response.data.data || response.data;
+                }
+
+                if (response.statusCode === 429) {
+                    const retryAfter = (response.data.retry_after || this.retryDelay) * 1000;
+                    await this.sleep(retryAfter);
+                    attempt++;
+                    continue;
+                }
+
+                this.handleErrorResponse(response.statusCode, response.data);
+            } catch (e) {
+                lastError = e;
+                attempt++;
+                if (attempt < this.retryAttempts) {
+                    await this.sleep(this.retryDelay * attempt);
+                }
+            }
+        }
+
+        throw lastError || new NetworkError('Request failed after retries');
+    }
+
+    /**
+     * Make HTTP request
+     * 
+     * @private
+     */
+    makeHttpRequest(method, url, headers, data) {
+        return new Promise((resolve, reject) => {
+            const protocol = url.protocol === 'https:' ? https : http;
+            
+            const options = {
+                method,
+                headers,
+                timeout: this.timeout
+            };
+
+            const req = protocol.request(url, options, (res) => {
+                let body = '';
+                
+                res.on('data', (chunk) => {
+                    body += chunk;
+                });
+                
+                res.on('end', () => {
+                    try {
+                        const responseData = JSON.parse(body);
+                        resolve({
+                            statusCode: res.statusCode,
+                            data: responseData
+                        });
+                    } catch (e) {
+                        reject(new Error('Invalid JSON response'));
+                    }
+                });
+            });
+
+            req.on('error', (e) => {
+                reject(new NetworkError('Network error: ' + e.message));
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new NetworkError('Request timeout'));
+            });
+
+            if (data && ['POST', 'PUT', 'PATCH'].includes(method)) {
+                req.write(JSON.stringify(data));
+            }
+
+            req.end();
+        });
+    }
+
+    /**
+     * Handle error response from API
+     * 
+     * @private
+     */
+    handleErrorResponse(statusCode, data) {
+        const error = data.error || {};
+        const code = error.code || 'UNKNOWN_ERROR';
+        const message = error.message || 'An error occurred';
+
+        switch (code) {
+            case 'INVALID_API_KEY':
+                throw new ValidationError(message);
+            case 'RATE_LIMIT_EXCEEDED':
+                throw new RateLimitError(message);
+            case 'LICENSE_EXPIRED':
+                throw new ExpiredError(message);
+            case 'LICENSE_SUSPENDED':
+                throw new SuspendedError(message);
+            case 'LICENSE_REVOKED':
+                throw new RevokedError(message);
+            case 'SIGNATURE_VERIFICATION_FAILED':
+                throw new SignatureError(message);
+            default:
+                throw new LicenseError(message);
+        }
+    }
+
+    /**
+     * Verify response signature
+     * 
+     * @private
+     */
+    verifyResponse(response) {
+        if (!this.signatureVerifier) {
+            throw new SignatureError('Signature verifier not initialized');
+        }
+
+        const signature = response.signature;
+        const responseWithoutSignature = { ...response };
+        delete responseWithoutSignature.signature;
+
+        const payload = JSON.stringify(responseWithoutSignature);
+        
+        if (!this.signatureVerifier.verify(payload, signature)) {
+            throw new SignatureError('Signature verification failed');
+        }
+    }
+
+    /**
+     * Get cache key
+     * 
+     * @private
+     */
+    getCacheKey(...parts) {
+        return parts.join(':');
+    }
+
+    /**
+     * Get value from cache
+     * 
+     * @private
+     */
+    getFromCache(key) {
+        if (!this.cacheEnabled || !this.cache.has(key)) {
+            return null;
+        }
+
+        const cached = this.cache.get(key);
+        if (cached.expiresAt < Date.now()) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        return cached.data;
+    }
+
+    /**
+     * Set cache value
+     * 
+     * @private
+     */
+    setCache(key, data) {
+        if (!this.cacheEnabled) {
+            return;
+        }
+
+        this.cache.set(key, {
+            data,
+            expiresAt: Date.now() + (this.cacheTtl * 1000)
+        });
+    }
+
+    /**
+     * Validate configuration
+     * 
+     * @private
+     */
+    validateConfig(config) {
+        if (!config.apiKey) {
+            throw new Error('API key is required');
+        }
+    }
+
+    /**
+     * Validate license key format
+     * 
+     * @private
+     */
+    validateLicenseKey(licenseKey) {
+        if (!licenseKey) {
+            throw new ValidationError('License key cannot be empty');
+        }
+    }
+
+    /**
+     * Generate UUID v4
+     * 
+     * @private
+     */
+    generateUuid() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    /**
+     * Sleep utility
+     * 
+     * @private
+     */
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+// Exception classes
+class LicenseError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'LicenseError';
+    }
+}
+
+class ValidationError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'ValidationError';
+    }
+}
+
+class NetworkError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'NetworkError';
+    }
+}
+
+class SignatureError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'SignatureError';
+    }
+}
+
+class RateLimitError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'RateLimitError';
+    }
+}
+
+class ExpiredError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'ExpiredError';
+    }
+}
+
+class SuspendedError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'SuspendedError';
+    }
+}
+
+class RevokedError extends LicenseError {
+    constructor(message) {
+        super(message);
+        this.name = 'RevokedError';
+    }
+}
+
+module.exports = LicenseClient;
+module.exports.LicenseError = LicenseError;
+module.exports.ValidationError = ValidationError;
+module.exports.NetworkError = NetworkError;
+module.exports.SignatureError = SignatureError;
+module.exports.RateLimitError = RateLimitError;
+module.exports.ExpiredError = ExpiredError;
+module.exports.SuspendedError = SuspendedError;
+module.exports.RevokedError = RevokedError;
