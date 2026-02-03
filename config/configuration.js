@@ -24,7 +24,7 @@ class Configuration {
      * 
      * @param {Object} config - Configuration options
      * @param {string} config.apiKey - API key (required)
-     * @param {string} [config.baseUrl='https://api.getkeymanager.com'] - Base API URL
+     * @param {string} [config.baseUrl='https://dev.getkeymanager.com/api'] - Base API URL
      * @param {number} [config.timeout=30000] - Request timeout in ms
      * @param {boolean} [config.verifySignatures=true] - Verify response signatures
      * @param {string} [config.publicKey=null] - Public key for signature verification
@@ -41,7 +41,7 @@ class Configuration {
         this.validateConfig(config);
 
         this._apiKey = config.apiKey;
-        this._baseUrl = config.baseUrl || 'https://api.getkeymanager.com';
+        this._baseUrl = config.baseUrl || 'https://dev.getkeymanager.com/api';
         this._timeout = config.timeout !== undefined ? config.timeout : Configuration.DEFAULT_TIMEOUT;
         this._verifySignatures = config.verifySignatures !== false;
         

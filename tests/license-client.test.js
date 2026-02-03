@@ -34,9 +34,10 @@ MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtest
             const testClient = new LicenseClient({
                 apiKey: 'test_key',
             });
-            expect(testClient.baseUrl).toBe('https://api.getkeymanager.com');
-            expect(testClient.timeout).toBe(30000);
-            expect(testClient.verifySignatures).toBe(true);
+            // The client stores config in _config (private), not exposed directly
+            expect(testClient._config.getBaseUrl()).toBe('https://dev.getkeymanager.com/api');
+            expect(testClient._config.getTimeout()).toBe(30000);
+            expect(testClient._config.shouldVerifySignatures()).toBe(true);
         });
     });
 
@@ -88,7 +89,7 @@ MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtest
     });
 
     describe('validateOfflineLicense', () => {
-        test('should throw error when public key is missing', async () => {
+        test('should throw error when public key is missing', () => {
             const offlineLicense = JSON.stringify({
                 version: '1.0',
                 license: {
@@ -98,20 +99,18 @@ MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtest
                 signature: 'test_signature',
             });
 
-            await expect(client.validateOfflineLicense(offlineLicense)).rejects.toThrow();
+            expect(() => client.validateOfflineLicense(offlineLicense)).toThrow('Public key is required');
         });
 
-        test('should handle invalid JSON', async () => {
+        test('should handle invalid JSON', () => {
             const clientWithKey = new LicenseClient({
                 apiKey: testApiKey,
                 publicKey: testPublicKey,
                 verifySignatures: false,
             });
 
-            const result = await clientWithKey.validateOfflineLicense('invalid json');
-            
-            expect(result.valid).toBe(false);
-            expect(result).toHaveProperty('errors');
+            // Invalid JSON should throw ValidationException
+            expect(() => clientWithKey.validateOfflineLicense('invalid json')).toThrow('Invalid JSON');
         });
     });
 

@@ -156,5 +156,18 @@ module.exports = {
     RevokedError,
     ActivationError,
     FeatureError,
-    StateError
+    StateError,
+    // Aliases for backwards compatibility
+    LicenseException: LicenseError,
+    ValidationException: ValidationError,
+    NetworkException: NetworkError,
+    SignatureException: SignatureError,
+    RateLimitException: RateLimitError,
+    LicenseStatusException: LicenseStatusError,
+    ExpiredException: ExpiredError,
+    SuspendedException: SuspendedError,
+    RevokedException: RevokedError,
+    ActivationException: ActivationError,
+    FeatureException: FeatureError,
+    StateException: StateError
 };

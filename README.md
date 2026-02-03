@@ -1,6 +1,6 @@
-# License Management Platform - JavaScript SDK
+# KeyManager - JavaScript SDK
 
-Official JavaScript/Node.js SDK for the License Management Platform API.
+Official JavaScript/Node.js SDK for KeyManager (https://getkeymanager.com) License Management Platform API.
 
 **Version: 2.0.0** - Now with complete API coverage!
 
@@ -412,11 +412,11 @@ See the `/examples` directory for complete working examples:
 
 ## Support
 
-- Documentation: https://docs.getkeymanager.com
-- API Reference: https://api.getkeymanager.com/docs
-- Issues: https://github.com/getkeymanager/js-sdk/issues
-- Email: support@getkeymanager.com
-
+- **Website**: https://getkeymanager.com
+- **Documentation**: https://docs.getkeymanager.com
+- **API Reference**: https://dev.getkeymanager.com/api
+- **Issues**: https://github.com/getkeymanager/js-sdk/issues
+- **Email**: support@getkeymanager.com
 ## License
 
 MIT License - see LICENSE file for details

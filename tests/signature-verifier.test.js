@@ -2,7 +2,13 @@ const SignatureVerifier = require('../signature-verifier');
 
 describe('SignatureVerifier', () => {
     const testPublicKey = `-----BEGIN PUBLIC KEY-----
-MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtest
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs7YomalLburtHvOhxAn1
+Uu6RkoReGYdb1MABFZ6Vp+P6chFCdNrODCJ6lpaTYmrxEIxsnm7SxUoT7iYSc7o5
+gQtfrmoesJcmzashDdHbdK7zyCJDPKBxPaZeR1Ly6dYqxVYF2aewYlSlQhVpVsE3
+ZXwAys/1imearrKxKr0X/ZAtaQvcKO6UxkFZ+wG4f10/ACqRxlYKH9b3lx3PVGcd
+iTLTT+ySkzELIt7/yPrT5zIURtGS4qjMmp3rquNnjtT85meB21Tfmq2dOQiBnJny
+QQQ8PfK1xc9tQHTCsXrIZW1AnYDHpnUsFjyPgxj/W1kSR1IZohT6koKDNXY0G2Y5
+nwIDAQAB
 -----END PUBLIC KEY-----`;
 
     describe('Constructor', () => {
@@ -37,8 +43,8 @@ MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtest
 
         test('should handle empty data', () => {
             const signature = 'test_signature';
-            const result = verifier.verify('', signature);
-            expect(result).toBe(false);
+            // Empty data should throw an error
+            expect(() => verifier.verify('', signature)).toThrow('Data cannot be empty');
         });
     });
 
